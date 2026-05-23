@@ -271,6 +271,16 @@ If you are an AI assistant trying to help a user deploy to a Chinese / cheap sha
 
 MIT — see [LICENSE](LICENSE).
 
+## Author
+
+**Anton Kovrigin** · [@Legato12](https://github.com/Legato12) — game developer shipping with AI agents (Claude Code). **Open to remote / contract work.**
+
+- 📧 **[Kovrigin2010@gmail.com](mailto:Kovrigin2010@gmail.com)**
+- 💼 **[LinkedIn](https://www.linkedin.com/in/antonkovrigin/)** — `linkedin.com/in/antonkovrigin`
+- 🎮 **[Portfolio](https://tonygamedev.carrd.co/)** — `tonygamedev.carrd.co`
+- 🐛 [Open an issue](https://github.com/Legato12/ftp-deploy-shared/issues/new) for bugs, questions, or feature ideas
+- ⭐ If this saved you a weekend, [star the repo](https://github.com/Legato12/ftp-deploy-shared) so the next person finds it
+
 ## Origin
 
 Extracted from the **Castle Fight Hub** deployment (a Warcraft III custom-map community site on 西部数码 hosting). Co-developed end-to-end with **Claude Code** (Anthropic) while debugging every layer of the deployment — three failed approaches, three rounds of agent research, one working tool. Every symptom in the troubleshooting table above was actually encountered. PRs welcome to broaden hosting compatibility (Hostinger, GoDaddy shared, etc.).

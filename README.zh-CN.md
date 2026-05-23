@@ -127,6 +127,16 @@ DIR_CHMOD=755
 
 MIT — 见 [LICENSE](LICENSE)。
 
+## 作者
+
+**Anton Kovrigin** · [@Legato12](https://github.com/Legato12) — 游戏开发者，用 AI agent (Claude Code) 高效交付。**接远程 / 外包工作。**
+
+- 📧 **[Kovrigin2010@gmail.com](mailto:Kovrigin2010@gmail.com)**
+- 💼 **[LinkedIn](https://www.linkedin.com/in/antonkovrigin/)** — `linkedin.com/in/antonkovrigin`
+- 🎮 **[作品集](https://tonygamedev.carrd.co/)** — `tonygamedev.carrd.co`
+- 🐛 [提 issue](https://github.com/Legato12/ftp-deploy-shared/issues/new) 反馈 bug / 提需求
+- ⭐ 如果省了你的时间，[给个 Star](https://github.com/Legato12/ftp-deploy-shared) 让下一个人能找到它
+
 ## 来源
 
 从 **Castle Fight Hub**（一个魔兽争霸 III 自定义地图社区站点，部署在西部数码）的部署过程中提炼。和 **Claude Code**（Anthropic）一起端到端调试出来的——三次失败，三轮 agent 调研，最终一个能跑的工具。文档里每一个症状都是在真实主机上踩过的。欢迎 PR 扩展更多主机的兼容性。
