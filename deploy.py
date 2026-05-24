@@ -128,33 +128,79 @@ def _rename_aside(ftp: ftplib.FTP, remote_dir: str, dir_chmod: str = "") -> None
     print(f"      (root-owned {remote_dir} -> {parent.rstrip('/')}/{aside}, mkd fresh {name})")
 
 
+def _stor_with_size_verify(ftp: ftplib.FTP, filename: str, data: bytes,
+                            expected: int, max_tries: int = 6) -> bool:
+    """STOR `data` under `filename` (already cwd'd into parent dir).
+    Verifies remote SIZE matches `expected`. Retries on mismatch.
+
+    Some shared-hosting FTP servers (pure-ftpd behind Cloudflare / OVH /
+    西部数码 / DreamHost shared) silently truncate streaming uploads —
+    `STOR` returns 226 OK, control connection is happy, but the destination
+    file is short. Streaming straight from a file handle is what triggers it;
+    re-sending the same payload from a fresh BytesIO buffer with an
+    explicit blocksize usually succeeds. We then call `SIZE` to verify.
+
+    Returns True once `ftp.size(filename) == expected`. False after
+    max_tries failed attempts.
+    """
+    for attempt in range(1, max_tries + 1):
+        try: ftp.delete(filename)
+        except ftplib.error_perm: pass
+        # Brief pause between retries — pure-ftpd sometimes needs time after
+        # a partial transfer before accepting a fresh STOR cleanly.
+        if attempt > 1:
+            time.sleep(1.0 + 0.5 * attempt)
+        try:
+            ftp.voidcmd("TYPE I")
+            ftp.storbinary(f"STOR {filename}", io.BytesIO(data), blocksize=8192)
+        except (ftplib.error_temp, OSError):
+            # Connection hiccup — let next iteration try again
+            continue
+        try:
+            actual = ftp.size(filename)
+        except ftplib.error_perm:
+            actual = -1
+        if actual == expected:
+            return True
+    return False
+
+
 def ftp_upload_file(ftp: ftplib.FTP, local_path: Path, remote_path: str,
                     file_chmod: str = "644", dir_chmod: str = "755") -> None:
     """Upload one file. Auto-handles:
        - root-owned existing FILE: DELETE-then-STOR
        - root-owned existing PARENT DIR: rename-aside + recreate
+       - silent FTP truncation: SIZE-verify after STOR + retry from BytesIO
        - applies SITE CHMOD after STOR if file_chmod is set
     """
     remote_dir = "/".join(remote_path.split("/")[:-1]) or "/"
     filename = remote_path.rsplit("/", 1)[-1]
     ftp_ensure_dir(ftp, remote_dir, dir_chmod=dir_chmod)
     ftp.cwd(remote_dir)
+    # Read once into memory so retries don't re-read the disk file.
+    data = local_path.read_bytes()
+    expected = len(data)
     # Pre-delete: works because we own the parent dir, even if the file itself is root-owned.
     try: ftp.delete(filename)
     except ftplib.error_perm: pass
+    ok = False
     try:
-        with local_path.open("rb") as fh:
-            ftp.storbinary(f"STOR {filename}", fh)
+        ok = _stor_with_size_verify(ftp, filename, data, expected)
     except ftplib.error_perm as e:
         if "553" in str(e):
             # Parent dir itself is root-owned; we can't write inside.
             # Rename aside + recreate under our user, retry.
             _rename_aside(ftp, remote_dir, dir_chmod=dir_chmod)
             ftp.cwd(remote_dir)
-            with local_path.open("rb") as fh:
-                ftp.storbinary(f"STOR {filename}", fh)
+            ok = _stor_with_size_verify(ftp, filename, data, expected)
         else:
             raise
+    if not ok:
+        raise RuntimeError(
+            f"upload size mismatch (silent FTP truncation): {remote_path} "
+            f"(expected {expected} bytes, server kept returning a shorter file "
+            f"after {6} retries — check host's FTP buffer / proxy settings)"
+        )
     if file_chmod:
         try: ftp.voidcmd(f"SITE CHMOD {file_chmod} {filename}")
         except ftplib.error_perm: pass
@@ -168,17 +214,24 @@ def ftp_upload_bytes(ftp: ftplib.FTP, data: bytes, remote_path: str,
     filename = remote_path.rsplit("/", 1)[-1]
     ftp_ensure_dir(ftp, remote_dir, dir_chmod=dir_chmod)
     ftp.cwd(remote_dir)
+    expected = len(data)
     try: ftp.delete(filename)
     except ftplib.error_perm: pass
+    ok = False
     try:
-        ftp.storbinary(f"STOR {filename}", io.BytesIO(data))
+        ok = _stor_with_size_verify(ftp, filename, data, expected)
     except ftplib.error_perm as e:
         if "553" in str(e):
             _rename_aside(ftp, remote_dir, dir_chmod=dir_chmod)
             ftp.cwd(remote_dir)
-            ftp.storbinary(f"STOR {filename}", io.BytesIO(data))
+            ok = _stor_with_size_verify(ftp, filename, data, expected)
         else:
             raise
+    if not ok:
+        raise RuntimeError(
+            f"upload size mismatch (silent FTP truncation): {remote_path} "
+            f"(expected {expected} bytes after retries)"
+        )
     if file_chmod:
         try: ftp.voidcmd(f"SITE CHMOD {file_chmod} {filename}")
         except ftplib.error_perm: pass
