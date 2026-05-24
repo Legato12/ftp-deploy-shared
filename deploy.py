@@ -262,7 +262,17 @@ def ftp_delete_quiet(ftp: ftplib.FTP, remote_path: str) -> None:
         print(f"      (could not delete {remote_path}: {exc})")
 
 
-def upload_tree(ftp, local_root: Path, remote_root: str, file_chmod: str, dir_chmod: str, dry: bool) -> int:
+def upload_tree(ftp, local_root: Path, remote_root: str, file_chmod: str, dir_chmod: str,
+                dry: bool, reconnect=None):
+    """Walk local_root and upload every file. On per-file size-mismatch failure,
+    if `reconnect` is provided, drop the current FTP socket, open a fresh one and
+    retry that file once.
+
+    After many sequential STOR/SIZE round trips, pure-ftpd behind a Cloudflare-style
+    frontend sometimes enters a degraded state where every upload truncates regardless
+    of blocksize. A fresh socket clears it. Returns (count, ftp) so the caller can
+    pick up the (possibly swapped) FTP handle for the remainder of the deploy.
+    """
     count = 0
     for path in sorted(local_root.rglob("*")):
         if path.is_dir():
@@ -271,10 +281,20 @@ def upload_tree(ftp, local_root: Path, remote_root: str, file_chmod: str, dir_ch
         remote_path = f"{remote_root.rstrip('/')}/{rel}"
         if dry:
             print(f"      [dry] {remote_path}")
-        else:
+            count += 1
+            continue
+        try:
+            ftp_upload_file(ftp, path, remote_path, file_chmod=file_chmod, dir_chmod=dir_chmod)
+        except RuntimeError as e:
+            if reconnect is None:
+                raise
+            print(f"      [reconnect after size mismatch: {e.args[0][:80]}...]")
+            try: ftp.quit()
+            except Exception: pass
+            ftp = reconnect()
             ftp_upload_file(ftp, path, remote_path, file_chmod=file_chmod, dir_chmod=dir_chmod)
         count += 1
-    return count
+    return count, ftp
 
 
 # ---------------------------------------------------------------------------
@@ -371,8 +391,11 @@ def render_import_php(template_path: Path, token: str, db_host: str, db_name: st
 
 
 def run_sql_migration(ftp: ftplib.FTP, cfg: dict, sql_path: Path, web_root: str,
-                      deploy_dir: str, file_chmod: str, dir_chmod: str) -> bool:
-    """Upload db-data.b64 + import.php via FTP, trigger via HTTPS GET, return True on success."""
+                      deploy_dir: str, file_chmod: str, dir_chmod: str,
+                      reconnect=None) -> bool:
+    """Upload db-data.b64 + import.php via FTP, trigger via HTTPS GET, return True on success.
+    If `reconnect` is provided, the helper-file uploads will retry once with a fresh
+    FTP socket on size mismatch (handles connection-saturation truncation)."""
     print(f"[..] Parsing {sql_path.name} locally for prepared-statement upload...")
     data = sql_parse_file(sql_path)
     print(f"      schema: {len(data['schema'])} chars; "
@@ -397,8 +420,22 @@ def run_sql_migration(ftp: ftplib.FTP, cfg: dict, sql_path: Path, web_root: str,
 
     remote_deploy = f"{web_root.rstrip('/')}/{deploy_dir.strip('/')}"
     print(f"[..] Uploading data + helper to {remote_deploy}/ ...")
-    ftp_upload_bytes(ftp, b64, f"{remote_deploy}/db-data.b64", file_chmod=file_chmod, dir_chmod=dir_chmod)
-    ftp_upload_bytes(ftp, php, f"{remote_deploy}/import.php", file_chmod=file_chmod, dir_chmod=dir_chmod)
+
+    def _upload_with_reconnect(payload: bytes, remote_path: str):
+        nonlocal ftp
+        try:
+            ftp_upload_bytes(ftp, payload, remote_path, file_chmod=file_chmod, dir_chmod=dir_chmod)
+        except RuntimeError as e:
+            if reconnect is None:
+                raise
+            print(f"      [reconnect after size mismatch: {e.args[0][:80]}...]")
+            try: ftp.quit()
+            except Exception: pass
+            ftp = reconnect()
+            ftp_upload_bytes(ftp, payload, remote_path, file_chmod=file_chmod, dir_chmod=dir_chmod)
+
+    _upload_with_reconnect(b64, f"{remote_deploy}/db-data.b64")
+    _upload_with_reconnect(php, f"{remote_deploy}/import.php")
 
     site_url = require(cfg, "SITE_URL")
     url = f"{site_url.rstrip('/')}/{deploy_dir.strip('/')}/import.php?token={token}"
@@ -521,27 +558,45 @@ def main() -> int:
             if sql_path: print(f"[dry] Would run SQL migration via {deploy_dir}/import.php (token-protected GET)")
             return 0
 
+        reconnect = lambda: ftp_connect(cfg)
         ftp = ftp_connect(cfg)
         try:
-            # 1. site files
+            # 1. site files (with auto-reconnect on connection-saturation truncation)
             print(f"[..] Uploading site files to {web_root} ...")
-            n = upload_tree(ftp, tmp_dir, web_root, file_chmod, dir_chmod, dry=False)
+            n, ftp = upload_tree(ftp, tmp_dir, web_root, file_chmod, dir_chmod,
+                                 dry=False, reconnect=reconnect)
             print(f"[ok] Uploaded {n} files")
 
-            # 2. binary asset
+            # 2. binary asset — multi-MB binaries usually survive without reconnect;
+            # if they don't, retry once with a fresh socket.
             if asset_path:
                 print(f"[..] Uploading asset ({asset_path.stat().st_size // 1024 // 1024} MB) ...")
-                ftp_upload_file(ftp, asset_path,
-                                f"{asset_remote_dir.rstrip('/')}/{asset_path.name}",
-                                file_chmod=file_chmod, dir_chmod=dir_chmod)
+                try:
+                    ftp_upload_file(ftp, asset_path,
+                                    f"{asset_remote_dir.rstrip('/')}/{asset_path.name}",
+                                    file_chmod=file_chmod, dir_chmod=dir_chmod)
+                except RuntimeError as e:
+                    print(f"      [reconnect after asset upload: {e.args[0][:80]}...]")
+                    try: ftp.quit()
+                    except Exception: pass
+                    ftp = reconnect()
+                    ftp_upload_file(ftp, asset_path,
+                                    f"{asset_remote_dir.rstrip('/')}/{asset_path.name}",
+                                    file_chmod=file_chmod, dir_chmod=dir_chmod)
 
             # 3. delete obsolete files
             for rel in extra_delete:
                 ftp_delete_quiet(ftp, f"{web_root.rstrip('/')}/{rel}")
 
-            # 4. SQL migration
+            # 4. SQL migration — fresh socket before this leg; long site upload may
+            # have saturated the current one, and SQL payload uploads are bigger
+            # and more sensitive to truncation.
             if sql_path:
-                ok = run_sql_migration(ftp, cfg, sql_path, web_root, deploy_dir, file_chmod, dir_chmod)
+                try: ftp.quit()
+                except Exception: pass
+                ftp = reconnect()
+                ok = run_sql_migration(ftp, cfg, sql_path, web_root, deploy_dir,
+                                       file_chmod, dir_chmod, reconnect=reconnect)
                 if not ok:
                     print("[!] SQL migration failed — your files are deployed but DB is not migrated.")
                     return 2
