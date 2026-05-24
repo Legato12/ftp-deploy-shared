@@ -128,33 +128,45 @@ def _rename_aside(ftp: ftplib.FTP, remote_dir: str, dir_chmod: str = "") -> None
     print(f"      (root-owned {remote_dir} -> {parent.rstrip('/')}/{aside}, mkd fresh {name})")
 
 
+# Blocksizes used by _stor_with_size_verify, in order tried per retry.
+# Empirically on pure-ftpd behind Cloudflare on shared hosting:
+#   8192 / 4096 / 2048 → fail on ~30% of files >5 KB (silent truncation)
+#   1024 → succeeds almost always, slightly slower
+#    512 → essentially bulletproof, twice as slow as 1024
+# We start fast and degrade to bulletproof so 99% of uploads are fast
+# but the rare stubborn file still eventually lands intact.
+_STOR_BLOCKSIZES = [8192, 4096, 2048, 1024, 1024, 512, 512, 512]
+
+
 def _stor_with_size_verify(ftp: ftplib.FTP, filename: str, data: bytes,
-                            expected: int, max_tries: int = 6) -> bool:
+                            expected: int) -> bool:
     """STOR `data` under `filename` (already cwd'd into parent dir).
     Verifies remote SIZE matches `expected`. Retries on mismatch.
 
     Some shared-hosting FTP servers (pure-ftpd behind Cloudflare / OVH /
     西部数码 / DreamHost shared) silently truncate streaming uploads —
     `STOR` returns 226 OK, control connection is happy, but the destination
-    file is short. Streaming straight from a file handle is what triggers it;
-    re-sending the same payload from a fresh BytesIO buffer with an
-    explicit blocksize usually succeeds. We then call `SIZE` to verify.
+    file is short. The truncation point is roughly aligned with the TCP /
+    proxy buffer size, so we cycle through *decreasing* blocksizes on
+    retry — large/fast first for healthy hosts, small/reliable last for
+    the stubborn ones. Each STOR is re-sent from a fresh BytesIO buffer.
+    We then call `SIZE` to verify against the expected length.
 
     Returns True once `ftp.size(filename) == expected`. False after
-    max_tries failed attempts.
+    all blocksize tiers exhausted.
     """
-    for attempt in range(1, max_tries + 1):
+    for attempt, blocksize in enumerate(_STOR_BLOCKSIZES, start=1):
         try: ftp.delete(filename)
         except ftplib.error_perm: pass
         # Brief pause between retries — pure-ftpd sometimes needs time after
         # a partial transfer before accepting a fresh STOR cleanly.
         if attempt > 1:
-            time.sleep(1.0 + 0.5 * attempt)
+            time.sleep(0.8 + 0.3 * attempt)
         try:
             ftp.voidcmd("TYPE I")
-            ftp.storbinary(f"STOR {filename}", io.BytesIO(data), blocksize=8192)
+            ftp.storbinary(f"STOR {filename}", io.BytesIO(data), blocksize=blocksize)
         except (ftplib.error_temp, OSError):
-            # Connection hiccup — let next iteration try again
+            # Connection hiccup — let next iteration try again with smaller blocks
             continue
         try:
             actual = ftp.size(filename)
@@ -199,7 +211,8 @@ def ftp_upload_file(ftp: ftplib.FTP, local_path: Path, remote_path: str,
         raise RuntimeError(
             f"upload size mismatch (silent FTP truncation): {remote_path} "
             f"(expected {expected} bytes, server kept returning a shorter file "
-            f"after {6} retries — check host's FTP buffer / proxy settings)"
+            f"after {len(_STOR_BLOCKSIZES)} retries with decreasing blocksizes — "
+            f"check host's FTP buffer / proxy settings)"
         )
     if file_chmod:
         try: ftp.voidcmd(f"SITE CHMOD {file_chmod} {filename}")
